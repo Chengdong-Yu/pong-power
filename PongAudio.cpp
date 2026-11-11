@@ -7,9 +7,11 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOService.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <libkern/c++/OSData.h>
 #include "PongLowDma.h"
 extern "C" {
@@ -18,6 +20,7 @@ extern "C" {
 #include "ShengAudioReach.h"
 #include "ShengAudioAbi.h"
 #include "GeniI2c.h"
+#include "QcomRpmh.h"
 #include "PongPlatformResources.h"
 void PongAudioServiceStaticInit(void);
 bool pong_audio_service_classes_ready(void);
@@ -391,10 +394,14 @@ void stop(bool drain=true){
  memset(active,0,sizeof active);inflight=0;
  __atomic_and_fetch(&ctl->state,~ShengAudioOutputRunning,__ATOMIC_RELEASE);
 }
+#include "PongWcd938.h"
 void worker(void *,wait_result_t){uint64_t end=nowMs()+90000;while(!up&&nowMs()<end)IOSleep(100);if(!up||!framework()){fail(1,-60);return;}IOLog("PongAudio: APM framework ready\n");if(!setupBus()){fail(2,-6);return;}if(!setupAmps()){fail(3,-6);return;}
  // Tertiary MI2S pins: sck121, data0 122, ws123, data1 124, function1 / 8mA.
  for(unsigned n=121;n<=124;n++)pin(n,(1u<<2)|(3u<<6),-1);
  if(!setupDma()){fail(4,-12);return;}if(!shared()||!openGraphs()){amps(false);fail(5,native_audio_stats[1]);return;}
+ // Acquire this board's actual codec prerequisites before publishing an
+ // input. A failure leaves the working independent MI2S speaker intact.
+ (void)pongWcd.open();
  ctl->state=ShengAudioOutputReady;if(!pong_audio_service_classes_ready()){fail(6,-2);return;}__atomic_store_n(&serving,1,__ATOMIC_RELEASE);sheng_audio_service_start();if(native_audio_service[0]!=1){__atomic_store_n(&serving,0,__ATOMIC_RELEASE);ctl->state=0;amps(false);fail(6,-3);return;}IOLog("PongAudio: TFA9873 stereo output service published\n");native_audio_stats[0]=7;
  for(;;){if(!up||(smmu.r(cbOffset+0x58)&0xc00001feu)){if(running)stop(false);ctl->state=0;__atomic_store_n(&serving,0,__ATOMIC_RELEASE);fail(10,-5);return;}unsigned want=__atomic_load_n(&wanted,__ATOMIC_ACQUIRE);
   if(want){stopAskedAt=0;if(!running)start();}
@@ -415,6 +422,17 @@ void worker(void *,wait_result_t){uint64_t end=nowMs()+90000;while(!up&&nowMs()<
 }
 }
 extern "C" IOBufferMemoryDescriptor *sheng_audio_memory(uint32_t type){if(!serving)return nullptr;auto d=type==0?control:type==1?outRing:nullptr;if(d)d->retain();return d;}
+extern "C" void pong_audio_describe_codec(IOService *service) {
+ if(!service)return;
+ service->setProperty("PongCodecBringupStage",uint64_t(pongWcd.stage),32);
+ service->setProperty("PongCodecBringupError",uint64_t(pongWcd.error),32);
+ service->setProperty("PongCodecDeviceNumber",uint64_t(pongWcd.device),32);
+ service->setProperty("PongCodecHardwareIdentity",pongWcd.hardwareId,64);
+ service->setProperty("PongCodecMasterVersion",uint64_t(pongWcd.version),32);
+ service->setProperty("PongCodecCaptureQualified",kOSBooleanFalse);
+ IOLog("Pong WCD938 snapshot: stage=%u error=%u device=%u version=%x identity=%x; direct PCM and native input still required\n",
+  pongWcd.stage,pongWcd.error,pongWcd.device,pongWcd.version,pongWcd.identity);
+}
 extern "C" int sheng_audio_request(uint32_t selector){if(!serving)return -6;if(selector>1)return -45;if(selector==0){__atomic_add_fetch(&requestEpoch,1,__ATOMIC_ACQ_REL);__atomic_and_fetch(&ctl->state,~ShengAudioOutputStartFailed,__ATOMIC_RELEASE);}__atomic_store_n(&wanted,selector==0?1u:0u,__ATOMIC_RELEASE);IOLockWakeup(lock,&count,false);return 0;}
 extern "C" bool pong_audio_start_ready(void){return __atomic_load_n(&serving,__ATOMIC_ACQUIRE) && __atomic_load_n(&wanted,__ATOMIC_ACQUIRE) && __atomic_load_n(&startedEpoch,__ATOMIC_ACQUIRE)==__atomic_load_n(&requestEpoch,__ATOMIC_ACQUIRE) && (__atomic_load_n(&ctl->state,__ATOMIC_ACQUIRE)&ShengAudioOutputRunning);}
 extern "C" void sheng_audio_probe(void){unsigned mode=0;PE_parse_boot_argn("pong_audio",&mode,sizeof mode);if(!mode||lock)return;lock=IOLockAlloc();if(!lock)return;const ShengAdspClient client={state,receive};channel=sheng_adsp_channel("adsp_apps",512,20,1,&client,nullptr);thread_t t=nullptr;if(!channel||kernel_thread_start(worker,nullptr,&t)!=KERN_SUCCESS){fail(1,-12);return;}thread_deallocate(t);}

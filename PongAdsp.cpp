@@ -26,8 +26,7 @@ int sheng_fw_read(void *handle, uint64_t offset, void *to, size_t length);
 void sheng_fw_close(void *handle);
 }
 
-extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
-// [0] stage (see Stage; negative: the step that failed), [1] last error, [2] IPCC interrupts, [3] the DSP's slave-kernel bits (-1 no
+// [0] stage (see Stage; negative: the step that failed), [1] last error, [2] owned IPCC notifications, [3] the DSP's slave-kernel bits (-1 no
 // item), [4] items (bit 0 SMP2P in 443, 1 out 429, 2 GLINK 478, 3 479, 4 480, 8 our partition, 9 global partition), [5] QMP state | AOSS
 // link bits << 8, [6] RSC DRV id, [7] adsp.mbn KiB, [8] ms from the start call to "ready", [9] GLINK messages in, [10] out, [11] channels
 // up (bit per client) | version agreed << 14 | link broken << 15, [12] channel opens nobody serves, [13] last SCM x0, [14] its x1,
@@ -41,12 +40,12 @@ enum Stage {
     StMapped = 1, StSurveyed = 2, StFirmware = 3, StSmp2p = 4, StDoorbells = 5, StLoadState = 6, StRails = 7, StDtb = 8, StLoaded = 9,
     StStarted = 10, StReady = 11, StGlink = 12, StChannel = 13,
 };
-constexpr uint64_t kSmem = 0x80900000, kSmemSize = 0x200000, kMutex = 0x1f40000 + 3 * 0x1000, kIpcc = 0x0ed18000, kAoss = 0xc300000;
+constexpr uint64_t kSmem = 0x80900000, kSmemSize = 0x200000, kMutex = 0x1f40000 + 3 * 0x1000, kAoss = 0xc300000;
 constexpr uint64_t kRscDrv = 0x17a20000, kRscTcs = 0xd00, kCmdDb = 0x80860000, kCmdDbSize = 0x20000;
 constexpr uint64_t kAdspBase = 0x85700000, kAdspSize = 0x2800000, kDtbBase = 0x9e980000, kDtbSize = 0x80000;
 constexpr uint32_t kPasAdsp = 1, kPasDtb = 36, kRemotePid = 2, kItemIn = 443, kItemOut = 429, kItemCrash = 423;
 constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480, kGlinkFifo = 0x4000;
-constexpr uint32_t kSpiIpcc = 229, kSpiRsc = 5;
+constexpr uint32_t kSpiRsc = 5;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2;
 constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvRsc = 8, kEvSend = 16;
 constexpr unsigned kClients = 4, kQueue = 8;
@@ -71,7 +70,7 @@ void note(const char *prefix, const char *text) {
     native_adsp_text[at] = 0;
 }
 
-Window gSmemW, gMutex, gIpcc, gAoss, gRsc;
+Window gSmemW, gMutex, gAoss, gRsc;
 QcomSmem gSmem;
 QcomSmemPartition gPart;
 QcomSmp2p gP2p;
@@ -82,6 +81,8 @@ bool gGlinkStarted;
 QcomRscLayout gLayout;
 uint32_t gRscIrqBits;
 volatile uint32_t gPending, gRscDone;
+volatile int32_t gModemAopState;
+uint64_t gModemAopDeadline;
 
 // ---- clients ----
 struct Message {uint32_t length; uint8_t data[SHENG_ADSP_MAX_MESSAGE];};
@@ -108,18 +109,11 @@ void wake(uint32_t bits) {
 }
 
 // ---- interrupts: acknowledge, record, wake ----
-void ipccIrq(void *) {
-    uint32_t bits = 0;
-    for (unsigned n = 0; n < 32; ++n) {
-        const uint32_t id = rd(gIpcc, QCOM_IPCC_RECV_ID);
-        if (id == QCOM_IPCC_NONE) break;
-        wr(gIpcc, QCOM_IPCC_RECV_CLEAR, id);
-        if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P)) bits |= kEvSmp2p;
-        else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvGlink;
-        else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvAop;
-    }
+void ipccIrq(void *event) {
+    // The shared receiver has already acknowledged just our notification.
+    // Do not read/clear MPSS doorbells from the audio handler.
     native_adsp_stats[2] = native_adsp_stats[2] + 1;
-    if (bits) wake(bits);
+    wake(uint32_t(reinterpret_cast<uintptr_t>(event)));
 }
 void rscIrq(void *) {
     const uint32_t status = rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits;
@@ -141,22 +135,25 @@ uint32_t waitEvents(uint32_t ms) {
     return __atomic_exchange_n(&gPending, 0, __ATOMIC_ACQ_REL);
 }
 
-void ring(uint32_t client, uint32_t signal) {wr(gIpcc, QCOM_IPCC_SEND, qcom_ipcc_id(client, signal));}
+void ring(uint32_t client, uint32_t signal) {
+    if(!pong_ipcc_send(client,signal))fail(StDoorbells,kIOReturnNotReady);
+}
 void kickAop(void *) {ring(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP);}
 void kickGlink(void *) {ring(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP);}
 void kickSmp2p() {ring(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P);}
 
 // ---- SMEM helpers (allocation under the TCSR hardware mutex) ----
 bool lockSmem() {
+    if(!pong_smem_local_lock())return false;
     // The mutex is held only for the few writes of one allocation by whichever processor has it; it is tried a bounded number of times.
     for (unsigned i = 0; i < 1000; ++i) {
         wr(gMutex, 0, 1);
         if (rd(gMutex, 0) == 1) return true;
         IODelay(10);
     }
-    return false;
+    pong_smem_local_unlock();return false;
 }
-void unlockSmem() {wr(gMutex, 0, 0);}
+void unlockSmem() {wr(gMutex, 0, 0);pong_smem_local_unlock();}
 int allocItem(uint16_t item, uint32_t size) {
     if (!lockSmem()) return -16;
     const int rc = qcom_smem_alloc(&gSmem, &gPart, item, size);
@@ -412,6 +409,23 @@ void serviceGlink() {
 }
 void service(uint32_t bits) {
     if (bits & kEvAop) qcom_qmp_step(&gQmp);
+    // One actual AOP mailbox owner. A modem worker must not reset or write
+    // the link which also owns the running audio DSP's load-state channel.
+    int32_t request=__atomic_load_n(&gModemAopState,__ATOMIC_ACQUIRE);
+    if(request==1 && native_adsp_stats[0]>=StReady && gQmp.state==QcomQmpOpen) {
+        int sent=qcom_qmp_send(&gQmp,"{class: image, res: load_state, name: modem, val: on}");
+        if(sent==QcomQmpSending) {
+            clock_interval_to_deadline(1000,kMillisecondScale,&gModemAopDeadline);
+            __atomic_store_n(&gModemAopState,2,__ATOMIC_RELEASE);
+        } else __atomic_store_n(&gModemAopState,-EIO,__ATOMIC_RELEASE);
+    } else if(request==2) {
+        int state=qcom_qmp_step(&gQmp);
+        if(state==QcomQmpOpen)__atomic_store_n(&gModemAopState,3,__ATOMIC_RELEASE);
+        else if(state<0 || mach_absolute_time()>=gModemAopDeadline) {
+            qcom_qmp_abandon(&gQmp);
+            __atomic_store_n(&gModemAopState,-ETIMEDOUT,__ATOMIC_RELEASE);
+        }
+    }
     if (bits & (kEvSmp2p | kEvGlink)) serviceSmp2p();
     if (bits & (kEvGlink | kEvSend)) {applyClients(); serviceGlink();}
 }
@@ -470,19 +484,17 @@ void pumpSends() {
 // ---- the bring-up ----
 bool gIrq;
 bool attachIrqs() {
-    if (!armcpu_spi_attach) return false;
     int rc = 0;
     for (unsigned tries = 0;; ++tries) {  // the GIC driver may not have started yet (as ButtonProbe found)
-        rc = armcpu_spi_attach(32 + kSpiIpcc, false, ipccIrq, nullptr, nullptr, nullptr);
+        rc=pong_ipcc_subscribe(QCOM_IPCC_CLIENT_LPASS,QCOM_IPCC_SIGNAL_SMP2P,ipccIrq,reinterpret_cast<void *>(uintptr_t(kEvSmp2p)));
         if (rc != kIOReturnNotReady || tries == 240) break;
         IOSleep(250);
     }
     if (rc) {fail(StDoorbells, rc); return false;}
     // TCS4 is polled by the shared Pong RPMh owner; no RSC IRQ theft.
-    const uint32_t enable[3] = {qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P),
-                                qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP),
-                                qcom_ipcc_id(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP)};
-    for (uint32_t id : enable) wr(gIpcc, QCOM_IPCC_RECV_ENABLE, id);
+    rc=pong_ipcc_subscribe(QCOM_IPCC_CLIENT_LPASS,QCOM_IPCC_SIGNAL_GLINK_QMP,ipccIrq,reinterpret_cast<void *>(uintptr_t(kEvGlink)));
+    if(!rc)rc=pong_ipcc_subscribe(QCOM_IPCC_CLIENT_AOP,QCOM_IPCC_SIGNAL_GLINK_QMP,ipccIrq,reinterpret_cast<void *>(uintptr_t(kEvAop)));
+    if(rc){fail(StDoorbells,rc);return false;}
     gIrq = true;
     return true;
 }
@@ -607,7 +619,7 @@ void adspThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pong_adsp");
     unsigned mode = 0;
     PE_parse_boot_argn("pong_adsp", &mode, sizeof mode);
-    if (!mapWindow(gSmemW, kSmem, kSmemSize) || !mapWindow(gMutex, kMutex, 0x1000) || !mapWindow(gIpcc, kIpcc, 0x1000) ||
+    if (!mapWindow(gSmemW, kSmem, kSmemSize) || !mapWindow(gMutex, kMutex, 0x1000) ||
         !mapWindow(gAoss, kAoss, 0x1000) || !mapWindow(gRsc, kRscDrv, 0x10000)) {
         fail(StMapped, -12);releaseFirmwareScratch();
         return;
@@ -630,6 +642,22 @@ void adspThread(void *, wait_result_t) {
     }
 }
 }  // namespace
+
+extern "C" int pong_aop_modem_power_on(void) {
+    if(native_adsp_stats[0]<0)return ENXIO;
+    if(native_adsp_stats[0]<StReady)return EAGAIN;
+    int32_t state=__atomic_load_n(&gModemAopState,__ATOMIC_ACQUIRE);
+    if(!state) {
+        int32_t empty=0;
+        (void)__atomic_compare_exchange_n(&gModemAopState,&empty,1,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+        wake(kEvAop);return EAGAIN;
+    }
+    return state==3?0:state<0?-state:EAGAIN;
+}
+extern "C" bool pong_adsp_running(void) {
+    return __atomic_load_n(&native_adsp_stats[0],__ATOMIC_ACQUIRE)>=StReady&&
+        !(__atomic_load_n(&gSlave,__ATOMIC_ACQUIRE)&kFatal);
+}
 
 extern "C" ShengAdspChannel *sheng_adsp_channel(const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
                                                 const ShengAdspClient *client, void *context) {

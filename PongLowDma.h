@@ -30,6 +30,22 @@ static inline bool usbAddress(uint64_t &result) {
     result<audio+AudioBytes && audio<result+UsbBytes)return false;
  return true;
 }
+static inline bool modemMetadataAddress(uint64_t &result) {
+ if(!lease("pong-modem-metadata",0x10000,result))return false;
+ uint64_t other=0;
+ if(lease("pong-audio-dma",AudioBytes,other)&&result<other+AudioBytes&&other<result+0x10000)return false;
+ if(lease("pong-usb-dma",UsbBytes,other)&&result<other+UsbBytes&&other<result+0x10000)return false;
+ return true;
+}
+static inline bool rmtfsAddress(uint64_t &result) {
+ constexpr unsigned bytes=0x280000;
+ if(!lease("pong-rmtfs-dma",bytes,result))return false;
+ uint64_t other=0;
+ const char *names[]={"pong-audio-dma","pong-usb-dma","pong-modem-metadata"};
+ const unsigned sizes[]={AudioBytes,UsbBytes,0x10000};
+ for(unsigned i=0;i<3;i++)if(lease(names[i],sizes[i],other)&&result<other+sizes[i]&&other<result+bytes)return false;
+ return true;
+}
 static inline bool usbHandoff(bool *phyRetained=nullptr) {
  // Version, core address, SID, flags (PHY/repeater retained + old DMA stopped).
  // Only a board loader that actually performed those operations may supply

@@ -47,13 +47,15 @@ public:
  IOBufferMemoryDescriptor *status=nullptr,*ring=nullptr;
  IOLock *gate=nullptr,*controlGate=nullptr,*ioGate=nullptr;
  bool running=false,clockRunning=false,starting=false,streamEnabled=true,draining=false;unsigned users=0;
- uint64_t origin=0,seed=0,readAt=0,drainEnd=0;bool readValid=false,pcmReported=false;
+ uint64_t origin=0,seed=1,readAt=0,drainEnd=0,producerBeforeStart=0;
+ bool readValid=false,pcmReported=false,awaitingProducer=false;
  unsigned gain=Audio2Gain[13],volume=13,muted=0;
  bool start(IOService *) override;
  void free() override;
  IOReturn setProperties(OSObject *) override;
  IOReturn newUserClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **) override;
  IOReturn startOutput(bool retained=false);IOReturn resumeOutput();void stopOutput();void clockLoop();
+ uint64_t framesAt(uint64_t) const;void publishClock(Audio2Status *,uint64_t);
  void controls();IOReturn control(unsigned,unsigned,uint64_t *);
  IOReturn setStreamActive(bool);
  bool fill(int32_t *,unsigned);
@@ -143,6 +145,9 @@ bool IOAudio2Device::start(IOService *p) {
  bool ok=gate&&controlGate&&ioGate&&status&&ring&&stream&&current&&available&&formats&&outputs&&inputs;
  if(ok){
   bzero(status->getBytesNoCopy(),4096);bzero(ring->getBytesNoCopy(),Audio2Frames*Audio2FrameBytes);
+  // The device and physical DSP use a continuous host timeline. A short
+  // system sound stopping is not a clock discontinuity for the next sound.
+  origin=mach_absolute_time();publishClock(static_cast<Audio2Status *>(status->getBytesNoCopy()),origin);
   audio2num(stream,"stream ID",1);audio2num(stream,"starting channel",1);audio2num(stream,"terminal type",'spkr');
   formats->setObject(available);stream->setObject("current format",current);stream->setObject("available formats",formats);outputs->setObject(stream);
   setProperty("device UID","Speaker");setProperty("device name","Speaker");setProperty("device manufacturer","Nothing");
@@ -198,6 +203,11 @@ IOReturn IOAudio2Device::startOutput(bool retained) {
   }
  }
  if(starting){IOLockUnlock(gate);return kIOReturnBusy;}
+ // Snapshot producer ownership before the potentially slow DSP start.
+ // A short native preview may commit while the hardware transition runs;
+ // taking this baseline afterward discards that sound as an old epoch.
+ auto st=static_cast<Audio2Status *>(status->getBytesNoCopy());
+ const uint64_t producerAtRequest=__atomic_load_n(&st->clientOutputEnd,__ATOMIC_ACQUIRE);
  starting=true;IOLockUnlock(gate);
  // Starting the physical DSP graph may take seconds. Neither PCM fill nor
  // a system volume/mute request may wait behind that hardware transition.
@@ -209,18 +219,21 @@ IOReturn IOAudio2Device::startOutput(bool retained) {
  bool ready=c&&pong_audio_start_ready();OSSafeReleaseNULL(shared);
  if(!ready){sheng_audio_request(1);IOLockLock(gate);starting=false;IOLockUnlock(gate);return kIOReturnNotReady;}
  IOLockLock(gate);starting=false;
- bzero(ring->getBytesNoCopy(),Audio2Frames*Audio2FrameBytes);origin=mach_absolute_time();seed++;readAt=0;readValid=true;pcmReported=false;streamEnabled=true;
- auto st=static_cast<Audio2Status *>(status->getBytesNoCopy());st->host=origin;st->frames=0;
- // Start returns before CoreAudio's IO thread writes these positions. A
- // previous session's output end must not be interpreted as fresh samples.
- __atomic_store_n(&st->clientInputEnd,0,__ATOMIC_RELEASE);
- __atomic_store_n(&st->clientOutputEnd,0,__ATOMIC_RELEASE);
- __atomic_store_n(&st->seed,seed,__ATOMIC_RELEASE);
+ // The ring was zeroed before first publication. Once mapped by HAL it is
+ // producer-owned: clearing it here destroys samples already committed
+ // during this genuine DSP start, especially brief ringtone previews.
+ const uint64_t now=mach_absolute_time();
+ publishClock(st,now);readAt=framesAt(now);readValid=true;pcmReported=false;streamEnabled=true;
+ // The producer owns +0x18/+0x20. Clearing those positions, and resetting
+ // the device clock to zero after a lock sound, races the HAL's retained
+ // stream epoch. Wait for a genuinely new commit instead of replaying its
+ // previous tail or overwriting its position fields.
+ producerBeforeStart=producerAtRequest;awaitingProducer=true;
  running=clockRunning=true;users=1;retain();thread_t t=nullptr;
  auto r=kernel_thread_start(audio2clock,this,&t);
  if(r!=KERN_SUCCESS){running=clockRunning=false;users=0;release();sheng_audio_request(1);}
  else thread_deallocate(t);
- IOLockUnlock(gate);IOLog("PongAudio2: native output start result=%x\n",r);return r==KERN_SUCCESS?kIOReturnSuccess:kIOReturnNoResources;
+ IOLockUnlock(gate);IOLog("PongAudio2: native output start result=%x clock_seed=%llu sample_epoch=%llu previous_producer=%llu\n",r,seed,readAt,producerBeforeStart);return r==KERN_SUCCESS?kIOReturnSuccess:kIOReturnNoResources;
 }
 void IOAudio2Device::stopOutput() {
  Audio2Transition transition(ioGate);
@@ -245,7 +258,7 @@ void IOAudio2Device::stopOutput() {
   }
  }
  IOLockLock(gate);const uint64_t left=draining && drainEnd>readAt?drainEnd-readAt:0;
- draining=false;running=false;sheng_audio_request(1);IOLockUnlock(gate);
+ draining=false;running=false;awaitingProducer=false;sheng_audio_request(1);IOLockUnlock(gate);
  IOLog("PongAudio2: native StopIO remaining_users=0 committed_tail=%llu unconsumed=%llu\n",pending,left);
 }
 IOReturn IOAudio2Device::resumeOutput() {
@@ -255,13 +268,18 @@ IOReturn IOAudio2Device::resumeOutput() {
  // reactivates its stream without adding another ownership reference.
  return startOutput(true);
 }
+uint64_t IOAudio2Device::framesAt(uint64_t tick) const {
+ uint64_t ns=0;absolutetime_to_nanoseconds(tick>=origin?tick-origin:0,&ns);
+ return ns/1000000000*Audio2Rate+(ns%1000000000)*Audio2Rate/1000000000;
+}
+void IOAudio2Device::publishClock(Audio2Status *st,uint64_t tick) {
+ const uint64_t frames=framesAt(tick)/Audio2Frames*Audio2Frames;uint64_t ticks=0;
+ nanoseconds_to_absolutetime(frames*62500/3,&ticks);
+ st->frames=frames;st->host=origin+ticks;__atomic_store_n(&st->seed,seed,__ATOMIC_RELEASE);
+}
 void IOAudio2Device::clockLoop() {
  for(;;){IOSleep(10);IOLockLock(gate);if(!running){clockRunning=false;IOLockWakeup(gate,&clockRunning,false);IOLockUnlock(gate);break;}
-  uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-origin,&ns);
-  uint64_t frames=(ns/1000000000*48000+(ns%1000000000)*48000/1000000000)/Audio2Frames*Audio2Frames,ticks=0;
-  nanoseconds_to_absolutetime(frames*62500/3,&ticks);
-  auto st=static_cast<Audio2Status *>(status->getBytesNoCopy());st->frames=frames;st->host=origin+ticks;
-  __atomic_store_n(&st->seed,seed,__ATOMIC_RELEASE);IOLockUnlock(gate);
+  publishClock(static_cast<Audio2Status *>(status->getBytesNoCopy()),mach_absolute_time());IOLockUnlock(gate);
  }release();
 }
 IOReturn IOAudio2Device::control(unsigned id,unsigned value,uint64_t *result) {
@@ -278,8 +296,7 @@ IOReturn IOAudio2Device::control(unsigned id,unsigned value,uint64_t *result) {
 bool IOAudio2Device::fill(int32_t *dst,unsigned frames) {
  if(!gate||frames>Audio2Frames||!IOLockTryLock(gate))return false;
  if(!running){IOLockUnlock(gate);return false;}
- uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-origin,&ns);
- const uint64_t now=(ns/1000000000)*48000+(ns%1000000000)*48000/1000000000;
+ const uint64_t now=framesAt(mach_absolute_time());
  auto st=static_cast<Audio2Status *>(status->getBytesNoCopy());
  // 22H374 write_data_to_stream publishes the exclusive committed output
  // sample position at +0x20 after copying. Never replay a previous wrap or
@@ -288,6 +305,10 @@ bool IOAudio2Device::fill(int32_t *dst,unsigned frames) {
  bzero(dst,frames*2*sizeof(*dst));
  if(!streamEnabled&&!draining){IOLockUnlock(gate);return true;}
  if(!end){IOLockUnlock(gate);return true;}
+ if(awaitingProducer && !draining) {
+  if(end==producerBeforeStart){IOLockUnlock(gate);return true;}
+  awaitingProducer=false;readValid=false;
+ }
  // The producer can retain its sample epoch across display sleep while a
  // new native engine clock starts at zero. Consume only committed samples;
  // never reject every future buffer because its epoch differs from ours.
@@ -318,7 +339,14 @@ bool IOAudio2Device::fill(int32_t *dst,unsigned frames) {
 }
 IOReturn IOAudio2Device::setStreamActive(bool enabled) {
  IOLockLock(gate);const bool changed=streamEnabled!=enabled;
- streamEnabled=enabled;if(changed)readValid=false;IOLockUnlock(gate);
+ streamEnabled=enabled;
+ if(changed && enabled) {
+  readValid=false;awaitingProducer=true;
+  producerBeforeStart=__atomic_load_n(&static_cast<Audio2Status *>(status->getBytesNoCopy())->clientOutputEnd,__ATOMIC_ACQUIRE);
+ }
+ // Disable precedes StopIO for short system sounds. Preserve the committed
+ // reader position so StopIO can drain that real tail, even while disabled.
+ IOLockUnlock(gate);
  if(changed)IOLog("PongAudio2: native output stream active=%u\n",enabled);
  return kIOReturnSuccess;
 }

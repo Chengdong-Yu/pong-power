@@ -15,6 +15,7 @@ extern "C" int sheng_audio_request(uint32_t selector);                     // 0 
 // [0] service state (1 published; negative: the step that failed), [1] opens, [2] closes, [3] requests, [4] refused requests,
 // [5] memory maps
 extern "C" {volatile int32_t native_audio_service[8];}
+extern "C" void pong_audio_describe_codec(IOService *);
 extern "C" vm_offset_t phystokv(uint64_t pa);
 extern "C" uint64_t pmap_find_pa(void *pmap, uint64_t va);
 // Darwin24 keeps this XNU function in Unsupported.exports; the generated
@@ -62,7 +63,7 @@ public:
         // iOS's audio server is sandboxed against unknown user clients; the kernel lets these processes open this service.
         setProperty("NativeSandboxGrantProcess", "audiomxd,mediaserverd");
         setProperty("IOUserClientClass", "PongAudioUserClient");
-        registerService();
+        pong_audio_describe_codec(this);registerService();
         return true;
     }
 };
